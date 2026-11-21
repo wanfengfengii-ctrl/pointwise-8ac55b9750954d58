@@ -1,17 +1,15 @@
 from collections.abc import Callable
 from sqlite3 import Connection
 
-from freeze.batch_query import get_sealed_entry, sealed_digest
-from freeze.manifest import frame_digest
-from intake.raw_store import load_raw_frame
-from issue.consumption import claim_record
-from issue.package import OrdinaryPackage, Receipt, encode_package
-from issue.publication_store import (
-    Publication, allocate_publication_id, find_publication_by_request, insert_publication,
-)
+from freeze.batch_query import get_sealed_entry
+from issue.delivery import deliver_record
+from issue.package import Receipt
+from issue.publication_store import find_publication_by_request
+from request.feasibility import jointly_fulfillable
 from request.request_query import require_request
 from request.request_record import RequestStatus, mark_request_published
-from station_db import IntegrityFailure, write_transaction
+from request.reservation_query import available_originals, pending_candidates
+from station_db import Conflict, IntegrityFailure, write_transaction
 
 
 def publish(db: Connection, request_id: str, *, before_commit: Callable[[], None] | None = None) -> Receipt:
@@ -24,19 +22,17 @@ def publish(db: Connection, request_id: str, *, before_commit: Callable[[], None
             raise IntegrityFailure(f'published request {request_id!r} has no stored receipt')
 
         batch_id, record_id = ordinary.batch_id, ordinary.record_id
-        entry = get_sealed_entry(db, batch_id, record_id)
-        raw = load_raw_frame(db, batch_id, record_id)
-        if raw is None or raw.record_id != entry.record_id or raw.origin != entry.origin:
-            raise IntegrityFailure('source record identity or origin does not match the sealed entry')
-        if (not isinstance(raw.frame, bytes) or len(raw.frame) != entry.length
-                or frame_digest(raw.frame) != entry.digest):
-            raise IntegrityFailure('source waveform does not match the sealed entry')
+        get_sealed_entry(db, batch_id, record_id)
 
-        claim_record(db, batch_id, record_id, ordinary.request_id)
-        sequence, publication_id = allocate_publication_id(db)
-        result = Receipt(publication_id, ordinary.request_id, batch_id, record_id, raw.origin)
-        package = OrdinaryPackage(result, sealed_digest(db, batch_id), entry, raw.frame)
-        insert_publication(db, sequence, Publication(result, encode_package(package)))
+        # A directed request may claim an original only if every pending
+        # reservation in the batch can still be fulfilled without it.
+        pending = pending_candidates(db, batch_id)
+        if pending and not jointly_fulfillable(pending, available_originals(db, batch_id) - {record_id}):
+            raise Conflict(
+                f'original {record_id!r} in batch {batch_id!r} is required by a pending reservation'
+            )
+
+        result = deliver_record(db, ordinary.request_id, batch_id, record_id)
         mark_request_published(db, ordinary.request_id)
         if before_commit is not None:
             before_commit()

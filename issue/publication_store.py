@@ -3,6 +3,7 @@ from sqlite3 import Connection
 
 from intake.origin import Origin
 from issue.package import Receipt
+from issue.schema import PUBLICATIONS_DDL, migrate_exchange_schema
 
 
 @dataclass(frozen=True, slots=True)
@@ -12,18 +13,8 @@ class Publication:
 
 
 def initialize_publication_schema(db: Connection) -> None:
-    db.execute('''
-        CREATE TABLE IF NOT EXISTS publications (
-            sequence INTEGER PRIMARY KEY CHECK (sequence > 0),
-            publication_id TEXT NOT NULL UNIQUE,
-            request_id TEXT NOT NULL UNIQUE REFERENCES ordinary_requests(request_id),
-            batch_id TEXT NOT NULL,
-            record_id TEXT NOT NULL,
-            origin TEXT NOT NULL,
-            package BLOB NOT NULL,
-            FOREIGN KEY (batch_id, record_id) REFERENCES consumed_records(batch_id, record_id)
-        )
-    ''')
+    migrate_exchange_schema(db)
+    db.execute(PUBLICATIONS_DDL)
 
 
 def allocate_publication_id(db: Connection) -> tuple[int, str]:

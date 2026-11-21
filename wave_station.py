@@ -22,7 +22,10 @@ from receive.acceptance_query import accepted as accepted
 from receive.acceptance_store import initialize_acceptance_schema
 from receive.accepted_record import AcceptedRecord
 from request.open_request import request as request
+from request.issue_reserved import issue_reserved as issue_reserved
 from request.request_record import initialize_request_schema
+from request.reserve import reserve as reserve
+from request.reservation_record import initialize_reservation_schema
 from station_db import Conflict as Conflict
 from station_db import InputError as InputError
 from station_db import IntegrityFailure as IntegrityFailure
@@ -40,6 +43,7 @@ def initialize_source(db: Connection) -> None:
         initialize_raw_schema(db)
         initialize_seal_schema(db)
         initialize_request_schema(db)
+        initialize_reservation_schema(db)
         initialize_consumption_schema(db)
         initialize_publication_schema(db)
 
@@ -106,9 +110,120 @@ def run_shift(directory: Path) -> tuple[SealedManifest, Publication, AcceptedRec
     return clearance, archived, checked
 
 
+def _load_reservation_cases() -> dict:
+    return json.loads((_EXAMPLES / 'reservation_cases.json').read_text(encoding='utf-8'))
+
+
+def _seal_twins(source) -> SealedManifest:
+    cases = _load_reservation_cases()
+    ingest(source, cases['batch_id'], read_frame_fixture(cases['frame_fixture']))
+    return seal(source, cases['batch_id'])
+
+
+def run_reservations(directory: Path) -> dict[str, object]:
+    """Reserve a wide and narrow order, issue wide first, then replay after reopen."""
+    directory.mkdir(parents=True, exist_ok=True)
+    source_path = directory / 'source.sqlite3'
+    receiver_path = directory / 'receiver.sqlite3'
+    with closing(connect(source_path)) as source:
+        initialize_source(source)
+        _seal_twins(source)
+        cases = _load_reservation_cases()
+        wide_admitted = reserve(source, cases['batch_id'], 'W', cases['orders']['W'])
+        narrow_admitted = reserve(source, cases['batch_id'], 'N', cases['orders']['N'])
+        narrow_second = reserve(source, cases['batch_id'], 'N', cases['orders']['N'])
+        third = reserve(source, cases['batch_id'], 'T', cases['orders']['T'])
+        wide = issue_reserved(source, cases['batch_id'], 'W')
+        wide_package = receipt(source, wide.publication_id)
+        narrow = issue_reserved(source, cases['batch_id'], 'N')
+        narrow_package = receipt(source, narrow.publication_id)
+        wide_replay = issue_reserved(source, cases['batch_id'], 'W')
+
+    with closing(connect(receiver_path)) as receiver:
+        initialize_receiver(receiver)
+        wide_accepted = accept(receiver, wide_package.package)
+        narrow_accepted = accept(receiver, narrow_package.package)
+
+    # Reopen: replay the signed order and reissue the archived original by id.
+    with closing(connect(source_path)) as source:
+        wide_after_reopen = issue_reserved(source, cases['batch_id'], 'W')
+        archived_wide = receipt(source, wide.publication_id)
+        archived_narrow = receipt(source, narrow.publication_id)
+    with closing(connect(receiver_path)) as receiver:
+        reaccepted = accept(receiver, archived_wide.package)
+        rechecked = accepted(receiver, wide_accepted.acceptance_id)
+
+    return {
+        'admitted': [wide_admitted, narrow_admitted, narrow_second, third],
+        'receipts': {
+            'W': (wide.record_id, wide.origin.text, wide.publication_id),
+            'N': (narrow.record_id, narrow.origin.text, narrow.publication_id),
+        },
+        'received': {
+            'W': (wide_accepted.record_id, wide_accepted.origin.text, wide_accepted.peak),
+            'N': (narrow_accepted.record_id, narrow_accepted.origin.text, narrow_accepted.peak),
+        },
+        'frames': (decode_package(wide_package.package).frame.hex(),
+                   decode_package(narrow_package.package).frame.hex()),
+        'wide_replay_stable': wide_replay == wide,
+        'reopen_replay_stable': wide_after_reopen == wide,
+        'archived_matches': archived_wide == wide_package and archived_narrow == narrow_package,
+        'reaccept_matches': reaccepted == wide_accepted and rechecked == wide_accepted,
+    }
+
+
+def run_direct_contention(directory: Path) -> dict[str, object]:
+    """One pending reservation lets a directed request take the spare original;
+    two pending reservations block both directed first issues."""
+    directory.mkdir(parents=True, exist_ok=True)
+    cases = _load_reservation_cases()
+    batch = cases['batch_id']
+
+    # Only W reserved: D-A (T09) may be signed, then W takes the remaining T02.
+    solo_path = directory / 'solo.sqlite3'
+    with closing(connect(solo_path)) as source:
+        initialize_source(source)
+        _seal_twins(source)
+        reserve(source, batch, 'W', cases['orders']['W'])
+        request(source, batch, 'D-A', cases['direct_requests']['D-A'])
+        direct = publish(source, 'D-A')
+        wide = issue_reserved(source, batch, 'W')
+    solo = {'direct': (direct.record_id, direct.origin.text),
+            'wide': (wide.record_id, wide.origin.text)}
+
+    # Both W and N reserved: both directed first issues are refused.
+    blocked_path = directory / 'blocked.sqlite3'
+    with closing(connect(blocked_path)) as source:
+        initialize_source(source)
+        _seal_twins(source)
+        reserve(source, batch, 'W', cases['orders']['W'])
+        reserve(source, batch, 'N', cases['orders']['N'])
+        request(source, batch, 'D-A', cases['direct_requests']['D-A'])
+        request(source, batch, 'D-B', cases['direct_requests']['D-B'])
+        blocked = []
+        for order in ('D-A', 'D-B'):
+            try:
+                publish(source, order)
+            except Conflict:
+                blocked.append(order)
+        wide = issue_reserved(source, batch, 'W')
+        narrow = issue_reserved(source, batch, 'N')
+    return {
+        'solo': solo,
+        'blocked_orders': blocked,
+        'still_fulfilled': {'W': wide.record_id, 'N': narrow.record_id},
+    }
+
+
+def _print_scenario(payload: dict) -> None:
+    print('POINTWISE_SCENARIO ' + json.dumps(payload, ensure_ascii=False, separators=(',', ':')))
+
+
 def _demo() -> None:
     with TemporaryDirectory(prefix='wave-station-demo-') as directory:
-        clearance, archived, checked = run_shift(Path(directory))
+        clearance, archived, checked = run_shift(Path(directory) / 'shift')
+        reservation_results = run_reservations(Path(directory) / 'reservations')
+        contention_results = run_direct_contention(Path(directory) / 'contention')
     input_rows = [
         {'record_id': record_id, 'origin': origin, 'frame_hex': frame.hex()}
         for record_id, origin, frame in read_frame_fixture('shift.json')
@@ -132,6 +247,39 @@ def _demo() -> None:
     }
     if actual != expected or downstream_actual != downstream_expected:
         raise IntegrityFailure('shift results differ from the independently checked example')
+
+    reservation_expected = {
+        'admitted': ['reserved', 'reserved', 'reserved', 'unavailable'],
+        'receipts': {'W': ['T02', 'R11 台架测道 7', 'P00000001'],
+                     'N': ['T09', 'R11 台架测道 4', 'P00000002']},
+        'received': {'W': ['T02', 'R11 台架测道 7', 6], 'N': ['T09', 'R11 台架测道 4', 6]},
+    }
+    reservation_actual = {
+        'admitted': reservation_results['admitted'],
+        'receipts': {k: list(v) for k, v in reservation_results['receipts'].items()},
+        'received': {k: list(v) for k, v in reservation_results['received'].items()},
+    }
+    if (reservation_actual != reservation_expected
+            or not reservation_results['wide_replay_stable']
+            or not reservation_results['reopen_replay_stable']
+            or not reservation_results['archived_matches']
+            or not reservation_results['reaccept_matches']
+            or reservation_results['frames'] != ('faff0400', 'faff0400')):
+        raise IntegrityFailure('reservation results differ from the independently checked example')
+
+    contention_expected = {
+        'solo': {'direct': ['T09', 'R11 台架测道 4'], 'wide': ['T02', 'R11 台架测道 7']},
+        'blocked_orders': ['D-A', 'D-B'],
+        'still_fulfilled': {'W': 'T02', 'N': 'T09'},
+    }
+    contention_actual = {
+        'solo': {k: list(v) for k, v in contention_results['solo'].items()},
+        'blocked_orders': contention_results['blocked_orders'],
+        'still_fulfilled': contention_results['still_fulfilled'],
+    }
+    if contention_actual != contention_expected:
+        raise IntegrityFailure('direct-entry contention differs from the expected outcome')
+
     print('POINTWISE_SCENARIO ' + json.dumps({
         'case_id': 'V1',
         'input': {'batch_id': clearance.batch_id, 'frames': input_rows},
@@ -146,6 +294,30 @@ def _demo() -> None:
         ],
         'oracle': '手算两个小端样例为 [-32768, 12] 和 [-3, 256]，比较绝对振幅并核对首行原号、出处和原始十六进制字节。',
     }, ensure_ascii=False, separators=(',', ':')))
+    _print_scenario({
+        'case_id': 'RESERVATION-WIDE-FIRST',
+        'admitted': reservation_actual['admitted'],
+        'expected': reservation_expected,
+        'actual': reservation_actual,
+        'replay': {
+            'wide_replay_stable': reservation_results['wide_replay_stable'],
+            'reopen_replay_stable': reservation_results['reopen_replay_stable'],
+            'archived_matches': reservation_results['archived_matches'],
+            'reaccept_matches': reservation_results['reaccept_matches'],
+        },
+        'code_paths': [
+            'request/reserve.py', 'request/feasibility.py', 'request/reservation_query.py',
+            'request/issue_reserved.py', 'issue/delivery.py', 'issue/publish.py',
+            'issue/receipt_query.py', 'receive/accept.py',
+        ],
+        'oracle': 'W 候选 {T09,T02}、N 候选 {T09}；先签宽单 W 仍必须领 T02，N 领 T09，两件同字节异原号异出处；重开按签发号复领同一件。',
+    })
+    _print_scenario({
+        'case_id': 'DIRECT-CONTENTION',
+        'expected': contention_expected,
+        'actual': contention_actual,
+        'oracle': '仅 W 预约时 D-A 可先领 T09，W 余领 T02；W、N 都预约时 D-A、D-B 首签均拒绝，两预约仍各领 T02、T09。',
+    })
 
 
 def main(argv: list[str] | None = None) -> int:
