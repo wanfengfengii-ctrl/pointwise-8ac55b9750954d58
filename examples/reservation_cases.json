@@ -1,0 +1,13 @@
+{
+  "batch_id": "TWINS",
+  "frame_fixture": "twins.json",
+  "orders": {
+    "W": ["T09", "T02"],
+    "N": ["T09"],
+    "T": ["T02"]
+  },
+  "direct_requests": {
+    "D-A": "T09",
+    "D-B": "T02"
+  }
+}
